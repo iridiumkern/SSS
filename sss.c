@@ -11,6 +11,8 @@
 #define WOTS_LEN 131
 
 #define TREE_HEIGHT 512
+#define HT_LAYERS 16
+#define HT_TREE_HEIGHT 32
 
 // Domain separation prefixes
 #define DOMAIN_WOTS    0x01
@@ -46,7 +48,6 @@ typedef struct {
     unsigned char auth_path[TREE_HEIGHT][HASH_OUT_SIZE];
 } sss_signature_t;
 
-// Explicit serialization for address to ensure platform-independent byte representation
 static void serialize_address(const sss_addr_t *addr, unsigned char *buf) {
     size_t offset = 0;
     for (int i = 0; i < 2; ++i) {
@@ -216,18 +217,14 @@ static void sss_address_from_message(const void *message, size_t message_size, s
     memcpy(address, hash, sizeof(sss_addr_t));
 }
 
-// Compute a subtree root or node given a starting address and height offset.
-// For a fully deterministic stateless tree, we compute nodes recursively or iteratively based on address navigation.
-static bool compute_node_at_height(const unsigned char *master_seed, const sss_addr_t *base_address, int height, unsigned char *node_out) {
+static bool compute_subtree_root(const unsigned char *master_seed, const sss_addr_t *base_address, int height, unsigned char *node_out) {
     if (height == 0) {
         return sss_leaf_from_address(master_seed, base_address, node_out);
     }
 
-    // Left child and right child addresses differ at the bit corresponding to height - 1
     sss_addr_t left_addr = *base_address;
     sss_addr_t right_addr = *base_address;
 
-    // Modify the bit at index (height - 1) across the 512-bit address space
     int bit_idx = height - 1;
     int chunk = bit_idx / 64;
     int bit_in_chunk = bit_idx % 64;
@@ -247,8 +244,8 @@ static bool compute_node_at_height(const unsigned char *master_seed, const sss_a
     unsigned char left_node[HASH_OUT_SIZE];
     unsigned char right_node[HASH_OUT_SIZE];
 
-    if (!compute_node_at_height(master_seed, &left_addr, height - 1, left_node)) return false;
-    if (!compute_node_at_height(master_seed, &right_addr, height - 1, right_node)) return false;
+    if (!compute_subtree_root(master_seed, &left_addr, height - 1, left_node)) return false;
+    if (!compute_subtree_root(master_seed, &right_addr, height - 1, right_node)) return false;
 
     bool res = sss_hash_node(left_node, right_node, node_out);
     memset(left_node, 0, HASH_OUT_SIZE);
@@ -256,14 +253,40 @@ static bool compute_node_at_height(const unsigned char *master_seed, const sss_a
     return res;
 }
 
+static bool compute_hypertree_root(const unsigned char *master_seed, sss_addr_t *addr, int current_layer, unsigned char *root_out) {
+    if (current_layer == 0) {
+        return compute_subtree_root(master_seed, addr, HT_TREE_HEIGHT, root_out);
+    }
+
+    unsigned char lower_root[HASH_OUT_SIZE];
+    sss_addr_t lower_addr = *addr;
+    lower_addr.hypertree[0] = (uint64_t)(current_layer - 1);
+
+    if (!compute_hypertree_root(master_seed, &lower_addr, current_layer - 1, lower_root)) {
+        return false;
+    }
+
+    wots_private_key priv;
+    wots_public_key pub;
+    if (!sss_ots_generate_private(master_seed, addr, &priv)) return false;
+    if (!wots_generate_public(&priv, &pub)) {
+        memset(&priv, 0, sizeof(priv));
+        return false;
+    }
+    memset(&priv, 0, sizeof(priv));
+
+    return compute_subtree_root(master_seed, addr, HT_TREE_HEIGHT, root_out);
+}
+
 bool sss_generate_keypair(unsigned char *master_seed, unsigned char *root) {
     if (master_seed == NULL || root == NULL) return false;
     if (!sss_get512randsecure(master_seed)) return false;
 
-    sss_addr_t zero_addr;
-    memset(&zero_addr, 0, sizeof(zero_addr));
+    sss_addr_t addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.hypertree[0] = (uint64_t)(HT_LAYERS - 1);
 
-    return compute_node_at_height(master_seed, &zero_addr, TREE_HEIGHT, root);
+    return compute_hypertree_root(master_seed, &addr, HT_LAYERS - 1, root);
 }
 
 bool sss_sign(const unsigned char *master_seed, const void *message, size_t message_size, unsigned char *signature_out) {
@@ -284,10 +307,9 @@ bool sss_sign(const unsigned char *master_seed, const void *message, size_t mess
     }
     memset(&priv, 0, sizeof(priv));
 
-    // Generate genuine authentication path from the tree
     sss_addr_t current_addr = sig->address;
     for (int h = 0; h < TREE_HEIGHT; ++h) {
-        int bit_idx = h;
+        int bit_idx = h % HT_TREE_HEIGHT;
         int chunk = bit_idx / 64;
         int bit_in_chunk = bit_idx % 64;
 
@@ -300,14 +322,12 @@ bool sss_sign(const unsigned char *master_seed, const void *message, size_t mess
         else if (chunk - 4 < 2) target_chunk = &sibling_addr.log[chunk - 4];
         else target_chunk = &sibling_addr.hypertree[chunk - 6];
 
-        // Flip bit to get sibling
         *target_chunk ^= (1ULL << bit_in_chunk);
 
-        if (!compute_node_at_height(master_seed, &sibling_addr, h, sig->auth_path[h])) {
+        if (!compute_subtree_root(master_seed, &sibling_addr, bit_idx, sig->auth_path[h])) {
             return false;
         }
 
-        // Clear bit in current_addr to track path upward
         *target_chunk &= ~(1ULL << bit_in_chunk);
     }
 
@@ -332,9 +352,9 @@ bool sss_verify(const unsigned char *root, const void *message, size_t message_s
     memset(&pub, 0, sizeof(pub));
 
     for (int h = 0; h < TREE_HEIGHT; ++h) {
-        int bit_idx = h;
-        int chunk = bit_idx / 64;
+        int bit_idx = h % HT_TREE_HEIGHT;
         int bit_in_chunk = bit_idx % 64;
+        int chunk = bit_idx / 64;
 
         uint64_t leaf_chunk_val = 0;
         if (chunk == 0) leaf_chunk_val = sig->address.leaf;
@@ -365,3 +385,52 @@ bool sss_verify(const unsigned char *root, const void *message, size_t message_s
     memset(current_node, 0, HASH_OUT_SIZE);
     return success;
 }
+
+#ifdef SSS_DEBUG
+// Only use this when actually debugging, uses printf!
+#include <stdio.h>
+
+void sss_debug_test(void) {
+    unsigned char master_seed[HASH_OUT_SIZE];
+    unsigned char root[HASH_OUT_SIZE];
+
+    printf("[DEBUG] Starting sss_debug_test...\n");
+
+    printf("[DEBUG] Testing keypair generation...\n");
+    if (!sss_generate_keypair(master_seed, root)) {
+        printf("[DEBUG] FAIL: sss_generate_keypair returned false.\n");
+        return;
+    }
+    printf("[DEBUG] PASS: Keypair generated successfully.\n");
+
+    const char *message = "Hello, SSS Cryptosystem!";
+    size_t message_size = strlen(message);
+
+    unsigned char signature_buf[sizeof(sss_signature_t)];
+    memset(signature_buf, 0, sizeof(signature_buf));
+
+    printf("[DEBUG] Testing signing process...\n");
+    if (!sss_sign(master_seed, message, message_size, signature_buf)) {
+        printf("[DEBUG] FAIL: sss_sign returned false.\n");
+        return;
+    }
+    printf("[DEBUG] PASS: Message signed successfully.\n");
+
+    printf("[DEBUG] Testing signature verification (valid message/sig)...\n");
+    if (!sss_verify(root, message, message_size, signature_buf)) {
+        printf("[DEBUG] FAIL: sss_verify failed on valid signature.\n");
+        return;
+    }
+    printf("[DEBUG] PASS: Signature verified successfully.\n");
+
+    printf("[DEBUG] Testing signature verification (tampered message)...\n");
+    const char *bad_message = "Tampered Message!";
+    if (sss_verify(root, bad_message, strlen(bad_message), signature_buf)) {
+        printf("[DEBUG] FAIL: sss_verify accepted a tampered message!\n");
+        return;
+    }
+    printf("[DEBUG] PASS: Tampered message correctly rejected.\n");
+
+    printf("[DEBUG] All debug tests completed successfully.\n");
+}
+#endif
