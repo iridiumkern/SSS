@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
 #include "sss.h"
 
 #define WOTS_W 16
@@ -10,11 +11,10 @@
 #define WOTS_LEN2 3
 #define WOTS_LEN 131
 
-#define TREE_HEIGHT 512
-#define HT_LAYERS 16
-#define HT_TREE_HEIGHT 32
+#define TREE_HEIGHT 64
+#define HT_LAYERS 8
+#define HT_TREE_HEIGHT 8
 
-// Domain separation prefixes
 #define DOMAIN_WOTS    0x01
 #define DOMAIN_PRIVATE 0x02
 #define DOMAIN_LEAF    0x03
@@ -43,9 +43,15 @@ typedef struct sss_addr_t {
 } sss_addr_t;
 
 typedef struct {
+    wots_signature sig;
+    unsigned char auth_path[HT_TREE_HEIGHT][HASH_OUT_SIZE];
+} hypertree_layer_t;
+
+typedef struct {
     sss_addr_t address;
     wots_signature wots_sig;
-    unsigned char auth_path[TREE_HEIGHT][HASH_OUT_SIZE];
+    unsigned char auth_path[HT_TREE_HEIGHT][HASH_OUT_SIZE];
+    hypertree_layer_t layers[HT_LAYERS - 1];
 } sss_signature_t;
 
 static void serialize_address(const sss_addr_t *addr, unsigned char *buf) {
@@ -53,16 +59,20 @@ static void serialize_address(const sss_addr_t *addr, unsigned char *buf) {
     for (int i = 0; i < 2; ++i) {
         uint64_t val = addr->hypertree[i];
         for (int b = 0; b < 8; ++b) buf[offset++] = (val >> (b * 8)) & 0xFF;
-    } for (int i = 0; i < 2; ++i) {
+    }
+    for (int i = 0; i < 2; ++i) {
         uint64_t val = addr->log[i];
         for (int b = 0; b < 8; ++b) buf[offset++] = (val >> (b * 8)) & 0xFF;
-    } for (int i = 0; i < 2; ++i) {
+    }
+    for (int i = 0; i < 2; ++i) {
         uint64_t val = addr->branch[i];
         for (int b = 0; b < 8; ++b) buf[offset++] = (val >> (b * 8)) & 0xFF;
-    } {
+    }
+    {
         uint64_t val = addr->twig;
         for (int b = 0; b < 8; ++b) buf[offset++] = (val >> (b * 8)) & 0xFF;
-    } {
+    }
+    {
         uint64_t val = addr->leaf;
         for (int b = 0; b < 8; ++b) buf[offset++] = (val >> (b * 8)) & 0xFF;
     }
@@ -88,20 +98,35 @@ static bool domain_hash(uint8_t domain, const void *data1, size_t size1, const v
 }
 
 static bool wots_hash(unsigned char *value) {
+    unsigned char input[1 + HASH_OUT_SIZE];
     unsigned char hash[HASH_OUT_SIZE];
-    if (!domain_hash(DOMAIN_WOTS, value, HASH_OUT_SIZE, NULL, 0, hash)) return false;
+
+    input[0] = DOMAIN_WOTS;
+    memcpy(input + 1, value, HASH_OUT_SIZE);
+
+    if (!sss_sha512(input, sizeof(input), hash)) {
+        memset(input, 0, sizeof(input));
+        memset(hash, 0, sizeof(hash));
+        return false;
+    }
+
     memcpy(value, hash, HASH_OUT_SIZE);
+
+    memset(input, 0, sizeof(input));
+    memset(hash, 0, sizeof(hash));
+
     return true;
 }
 
 static bool wots_chain(unsigned char *value, size_t steps) {
-    for (size_t i = 0; i < steps; ++i) {
-        if (!wots_hash(value)) {
-            memset(value, 0, 1);
-            return false;
-        }
-    }
-    return true;
+	while (steps-- != 0) {
+		if (!wots_hash(value)) {
+			memset(value, 0, HASH_OUT_SIZE);
+			return false;
+		}
+	}
+
+	return true;
 }
 
 static void wots_message_digits(const unsigned char *message, unsigned char *digits) {
@@ -123,18 +148,6 @@ static void wots_checksum(const unsigned char *digits, unsigned char *checksum) 
 static void wots_lengths(const unsigned char *message, unsigned char *lengths) {
     wots_message_digits(message, lengths);
     wots_checksum(lengths, lengths + WOTS_LEN1);
-}
-
-static bool wots_generate_public(const wots_private_key *private_key, wots_public_key *public_key) {
-    if (private_key == NULL || public_key == NULL) return false;
-    for (size_t i = 0; i < WOTS_LEN; ++i) {
-        memcpy(public_key->element[i], private_key->element[i], HASH_OUT_SIZE);
-        if (!wots_chain(public_key->element[i], WOTS_W - 1)) {
-            memset(public_key, 0, sizeof(*public_key));
-            return false;
-        }
-    }
-    return true;
 }
 
 static bool wots_sign(const wots_private_key *private_key, const unsigned char *message, wots_signature *signature) {
@@ -198,175 +211,229 @@ static bool sss_hash_node(const unsigned char *left, const unsigned char *right,
 }
 
 static bool sss_leaf_from_address(const unsigned char *master_seed, const sss_addr_t *address, unsigned char *leaf) {
-    wots_private_key priv;
     wots_public_key pub;
-    if (!sss_ots_generate_private(master_seed, address, &priv)) return false;
-    if (!wots_generate_public(&priv, &pub)) {
-        memset(&priv, 0, sizeof(priv));
-        return false;
-    }
-    memset(&priv, 0, sizeof(priv));
-    bool res = domain_hash(DOMAIN_LEAF, &pub, sizeof(pub), NULL, 0, leaf);
-    memset(&pub, 0, sizeof(pub));
-    return res;
-}
+    unsigned char serialized_addr[64];
+    unsigned char combined_input[64 + 4];
+    unsigned char value[HASH_OUT_SIZE];
 
-static void sss_address_from_message(const void *message, size_t message_size, sss_addr_t *address) {
-    unsigned char hash[HASH_OUT_SIZE];
-    sss_sha512(message, message_size, hash);
-    memcpy(address, hash, sizeof(sss_addr_t));
-}
+    if (master_seed == NULL || address == NULL || leaf == NULL) return false;
 
-static bool compute_subtree_root(const unsigned char *master_seed, const sss_addr_t *base_address, int height, unsigned char *node_out) {
-    if (height == 0) {
-        return sss_leaf_from_address(master_seed, base_address, node_out);
-    }
+    serialize_address(address, serialized_addr);
+    memcpy(combined_input, serialized_addr, 64);
 
-    sss_addr_t left_addr = *base_address;
-    sss_addr_t right_addr = *base_address;
+    for (size_t i = 0; i < WOTS_LEN; ++i) {
+        uint32_t idx = (uint32_t)i;
 
-    int bit_idx = height - 1;
-    int chunk = bit_idx / 64;
-    int bit_in_chunk = bit_idx % 64;
+        combined_input[64] = idx & 0xFF;
+        combined_input[65] = (idx >> 8) & 0xFF;
+        combined_input[66] = (idx >> 16) & 0xFF;
+        combined_input[67] = (idx >> 24) & 0xFF;
 
-    uint64_t *target_chunk_left = NULL;
-    uint64_t *target_chunk_right = NULL;
-
-    if (chunk == 0) { target_chunk_left = &left_addr.leaf; target_chunk_right = &right_addr.leaf; }
-    else if (chunk == 1) { target_chunk_left = &left_addr.twig; target_chunk_right = &right_addr.twig; }
-    else if (chunk - 2 < 2) { target_chunk_left = &left_addr.branch[chunk - 2]; target_chunk_right = &right_addr.branch[chunk - 2]; }
-    else if (chunk - 4 < 2) { target_chunk_left = &left_addr.log[chunk - 4]; target_chunk_right = &right_addr.log[chunk - 4]; }
-    else { target_chunk_left = &left_addr.hypertree[chunk - 6]; target_chunk_right = &right_addr.hypertree[chunk - 6]; }
-
-    *target_chunk_left &= ~(1ULL << bit_in_chunk);
-    *target_chunk_right |= (1ULL << bit_in_chunk);
-
-    unsigned char left_node[HASH_OUT_SIZE];
-    unsigned char right_node[HASH_OUT_SIZE];
-
-    if (!compute_subtree_root(master_seed, &left_addr, height - 1, left_node)) return false;
-    if (!compute_subtree_root(master_seed, &right_addr, height - 1, right_node)) return false;
-
-    bool res = sss_hash_node(left_node, right_node, node_out);
-    memset(left_node, 0, HASH_OUT_SIZE);
-    memset(right_node, 0, HASH_OUT_SIZE);
-    return res;
-}
-
-static bool compute_hypertree_root(const unsigned char *master_seed, sss_addr_t *addr, int current_layer, unsigned char *root_out) {
-    if (current_layer == 0) {
-        return compute_subtree_root(master_seed, addr, HT_TREE_HEIGHT, root_out);
-    }
-
-    unsigned char lower_root[HASH_OUT_SIZE];
-    sss_addr_t lower_addr = *addr;
-    lower_addr.hypertree[0] = (uint64_t)(current_layer - 1);
-
-    if (!compute_hypertree_root(master_seed, &lower_addr, current_layer - 1, lower_root)) {
-        return false;
-    }
-
-    wots_private_key priv;
-    wots_public_key pub;
-    if (!sss_ots_generate_private(master_seed, addr, &priv)) return false;
-    if (!wots_generate_public(&priv, &pub)) {
-        memset(&priv, 0, sizeof(priv));
-        return false;
-    }
-    memset(&priv, 0, sizeof(priv));
-
-    return compute_subtree_root(master_seed, addr, HT_TREE_HEIGHT, root_out);
-}
-
-bool sss_generate_keypair(unsigned char *master_seed, unsigned char *root) {
-    if (master_seed == NULL || root == NULL) return false;
-    if (!sss_get512randsecure(master_seed)) return false;
-
-    sss_addr_t addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.hypertree[0] = (uint64_t)(HT_LAYERS - 1);
-
-    return compute_hypertree_root(master_seed, &addr, HT_LAYERS - 1, root);
-}
-
-bool sss_sign(const unsigned char *master_seed, const void *message, size_t message_size, unsigned char *signature_out) {
-    if (master_seed == NULL || message == NULL || signature_out == NULL) return false;
-
-    sss_signature_t *sig = (sss_signature_t *)signature_out;
-    unsigned char msg_hash[HASH_OUT_SIZE];
-
-    sss_sha512(message, message_size, msg_hash);
-    sss_address_from_message(message, message_size, &sig->address);
-
-    wots_private_key priv;
-    if (!sss_ots_generate_private(master_seed, &sig->address, &priv)) return false;
-
-    if (!wots_sign(&priv, msg_hash, &sig->wots_sig)) {
-        memset(&priv, 0, sizeof(priv));
-        return false;
-    }
-    memset(&priv, 0, sizeof(priv));
-
-    sss_addr_t current_addr = sig->address;
-    for (int h = 0; h < TREE_HEIGHT; ++h) {
-        int bit_idx = h % HT_TREE_HEIGHT;
-        int chunk = bit_idx / 64;
-        int bit_in_chunk = bit_idx % 64;
-
-        sss_addr_t sibling_addr = current_addr;
-        uint64_t *target_chunk = NULL;
-
-        if (chunk == 0) target_chunk = &sibling_addr.leaf;
-        else if (chunk == 1) target_chunk = &sibling_addr.twig;
-        else if (chunk - 2 < 2) target_chunk = &sibling_addr.branch[chunk - 2];
-        else if (chunk - 4 < 2) target_chunk = &sibling_addr.log[chunk - 4];
-        else target_chunk = &sibling_addr.hypertree[chunk - 6];
-
-        *target_chunk ^= (1ULL << bit_in_chunk);
-
-        if (!compute_subtree_root(master_seed, &sibling_addr, bit_idx, sig->auth_path[h])) {
+        if (!domain_hash(DOMAIN_PRIVATE, master_seed, HASH_OUT_SIZE, combined_input, sizeof(combined_input), value)) {
+            memset(&pub, 0, sizeof(pub));
+            memset(value, 0, sizeof(value));
+            memset(combined_input, 0, sizeof(combined_input));
+            memset(serialized_addr, 0, sizeof(serialized_addr));
             return false;
         }
 
-        *target_chunk &= ~(1ULL << bit_in_chunk);
+        for (size_t step = 0; step < WOTS_W - 1; ++step) {
+            if (!wots_hash(value)) {
+                memset(&pub, 0, sizeof(pub));
+                memset(value, 0, sizeof(value));
+                memset(combined_input, 0, sizeof(combined_input));
+                memset(serialized_addr, 0, sizeof(serialized_addr));
+                return false;
+            }
+        }
+
+        memcpy(pub.element[i], value, HASH_OUT_SIZE);
+    }
+
+    bool res = domain_hash(DOMAIN_LEAF, &pub, sizeof(pub), NULL, 0, leaf);
+
+    memset(&pub, 0, sizeof(pub));
+    memset(value, 0, sizeof(value));
+    memset(combined_input, 0, sizeof(combined_input));
+    memset(serialized_addr, 0, sizeof(serialized_addr));
+
+    return res;
+}
+
+static void sss_set_layer(sss_addr_t *addr, int layer) {
+    addr->hypertree[0] = (uint64_t)layer;
+}
+
+static bool compute_subtree(const unsigned char *master_seed, const sss_addr_t *base_address, int height, unsigned char *root_out, unsigned char auth_path_out[][HASH_OUT_SIZE], uint64_t leaf_idx) {
+    if (!master_seed || !base_address || !root_out) return false;
+    if (height < 0 || height > 64) return false;
+    if (height >= (int)(sizeof(size_t) * 8 - 1)) return false;
+
+    size_t leaf_count = (size_t)1 << height;
+
+    if (leaf_idx >= leaf_count) return false;
+    if (leaf_count > SIZE_MAX / HASH_OUT_SIZE) return false;
+
+    unsigned char *nodes = malloc(leaf_count * HASH_OUT_SIZE);
+    unsigned char *next = malloc((leaf_count / 2) * HASH_OUT_SIZE);
+
+    if (!nodes || !next) {
+        free(nodes);
+        free(next);
+        return false;
+    }
+
+    for (size_t i = 0; i < leaf_count; ++i) {
+        sss_addr_t addr = *base_address;
+        addr.leaf = (addr.leaf & ~((UINT64_C(1) << height) - 1)) | i;
+
+        if (!sss_leaf_from_address(master_seed, &addr, nodes + i * HASH_OUT_SIZE)) {
+            free(nodes);
+            free(next);
+            return false;
+        }
+    }
+
+    size_t count = leaf_count;
+    size_t index = leaf_idx;
+
+    for (int h = 0; h < height; ++h) {
+        if (auth_path_out) {
+            size_t sibling = index ^ 1;
+
+            memcpy(auth_path_out[h], nodes + sibling * HASH_OUT_SIZE, HASH_OUT_SIZE);
+        }
+
+        for (size_t i = 0; i < count / 2; ++i) {
+            if (!sss_hash_node(nodes + (i * 2) * HASH_OUT_SIZE, nodes + (i * 2 + 1) * HASH_OUT_SIZE, next + i * HASH_OUT_SIZE)) {
+                free(nodes);
+                free(next);
+                return false;
+            }
+        }
+
+        memcpy(nodes, next, (count / 2) * HASH_OUT_SIZE);
+
+        index >>= 1;
+        count >>= 1;
+    }
+
+    memcpy(root_out, nodes, HASH_OUT_SIZE);
+
+    memset(nodes, 0, leaf_count * HASH_OUT_SIZE);
+    memset(next, 0, (leaf_count / 2) * HASH_OUT_SIZE);
+
+    free(nodes);
+    free(next);
+
+    return true;
+}
+
+bool sss_generate_keypair(unsigned char *master_seed, unsigned char *root) {
+    if (!master_seed || !root || !sss_get512randsecure(master_seed)) return false;
+
+    sss_addr_t addr;
+    memset(&addr, 0, sizeof(addr));
+
+    sss_set_layer(&addr, HT_LAYERS - 1);
+
+    if (!compute_subtree(master_seed, &addr, HT_TREE_HEIGHT, root, NULL, 0)) {
+        memset(root, 0, HASH_OUT_SIZE);
+        return false;
+    }
+
+    return true;
+}
+
+bool sss_sign(const unsigned char *master_seed, const void *message, size_t message_size, unsigned char *signature_out) {
+    if (!master_seed || !message || !signature_out) return false;
+
+    sss_signature_t *sig = (sss_signature_t *)signature_out;
+    unsigned char msg_hash[HASH_OUT_SIZE];
+    unsigned char current_input[HASH_OUT_SIZE];
+    sss_addr_t addr;
+
+    if (!sss_sha512(message, message_size, msg_hash)) return false;
+
+    uint64_t total_idx = 0;
+    memcpy(&total_idx, msg_hash, sizeof(total_idx));
+    memcpy(current_input, msg_hash, HASH_OUT_SIZE);
+
+    memset(&addr, 0, sizeof(addr));
+    memset(sig, 0, sizeof(*sig));
+
+    for (int layer = 0; layer < HT_LAYERS; ++layer) {
+        uint64_t leaf_idx;
+        wots_private_key priv;
+        wots_signature *wots_sig;
+        unsigned char (*auth_path)[HASH_OUT_SIZE];
+
+        sss_set_layer(&addr, layer);
+
+        leaf_idx = (total_idx >> (layer * HT_TREE_HEIGHT)) & ((UINT64_C(1) << HT_TREE_HEIGHT) - 1);
+
+        addr.leaf = leaf_idx;
+
+        if (!sss_ots_generate_private(master_seed, &addr, &priv)) {
+            memset(&priv, 0, sizeof(priv));
+            return false;
+        }
+
+        if (layer == 0) {
+            sig->address = addr;
+            wots_sig = &sig->wots_sig;
+            auth_path = sig->auth_path;
+        } else {
+            hypertree_layer_t *Layer = &sig->layers[layer - 1];
+            wots_sig = &Layer->sig;
+            auth_path = Layer->auth_path;
+        }
+
+        if (!wots_sign(&priv, current_input, wots_sig)) {
+            memset(&priv, 0, sizeof(priv));
+            return false;
+        }
+
+        if (!compute_subtree(master_seed, &addr, HT_TREE_HEIGHT, current_input, auth_path, leaf_idx)) {
+            memset(&priv, 0, sizeof(priv));
+            return false;
+        }
+
+        memset(&priv, 0, sizeof(priv));
     }
 
     return true;
 }
 
 bool sss_verify(const unsigned char *root, const void *message, size_t message_size, const unsigned char *signature_in) {
-    if (root == NULL || message == NULL || signature_in == NULL) return false;
+    if (!root || !message || !signature_in) return false;
 
     const sss_signature_t *sig = (const sss_signature_t *)signature_in;
     unsigned char msg_hash[HASH_OUT_SIZE];
-    sss_sha512(message, message_size, msg_hash);
+    sss_addr_t addr;
 
-    wots_public_key pub;
-    if (!wots_recover_public(&sig->wots_sig, msg_hash, &pub)) return false;
+    if (!sss_sha512(message, message_size, msg_hash)) return false;
+
+    uint64_t total_idx = 0;
+    memcpy(&total_idx, msg_hash, sizeof(total_idx));
+
+    memset(&addr, 0, sizeof(addr));
+    sss_set_layer(&addr, 0);
+    addr.leaf = total_idx & ((UINT64_C(1) << HT_TREE_HEIGHT) - 1);
+
+    if (memcmp(&sig->address, &addr, sizeof(addr)) != 0) return false;
 
     unsigned char current_node[HASH_OUT_SIZE];
-    if (!domain_hash(DOMAIN_LEAF, &pub, sizeof(pub), NULL, 0, current_node)) {
-        memset(&pub, 0, sizeof(pub));
-        return false;
-    }
-    memset(&pub, 0, sizeof(pub));
+    wots_public_key pub;
 
-    for (int h = 0; h < TREE_HEIGHT; ++h) {
-        int bit_idx = h % HT_TREE_HEIGHT;
-        int bit_in_chunk = bit_idx % 64;
-        int chunk = bit_idx / 64;
+    if (!wots_recover_public(&sig->wots_sig, msg_hash, &pub)) return false;
+    if (!domain_hash(DOMAIN_LEAF, &pub, sizeof(pub), NULL, 0, current_node)) return false;
 
-        uint64_t leaf_chunk_val = 0;
-        if (chunk == 0) leaf_chunk_val = sig->address.leaf;
-        else if (chunk == 1) leaf_chunk_val = sig->address.twig;
-        else if (chunk - 2 < 2) leaf_chunk_val = sig->address.branch[chunk - 2];
-        else if (chunk - 4 < 2) leaf_chunk_val = sig->address.log[chunk - 4];
-        else leaf_chunk_val = sig->address.hypertree[chunk - 6];
-
-        bool bit = (leaf_chunk_val >> bit_in_chunk) & 1;
-
+    for (int h = 0; h < HT_TREE_HEIGHT; ++h) {
+        bool bit = (addr.leaf >> h) & 1;
         unsigned char parent_input[HASH_OUT_SIZE * 2];
-        if (bit == 0) {
+
+        if (!bit) {
             memcpy(parent_input, current_node, HASH_OUT_SIZE);
             memcpy(parent_input + HASH_OUT_SIZE, sig->auth_path[h], HASH_OUT_SIZE);
         } else {
@@ -374,19 +441,40 @@ bool sss_verify(const unsigned char *root, const void *message, size_t message_s
             memcpy(parent_input + HASH_OUT_SIZE, current_node, HASH_OUT_SIZE);
         }
 
-        if (!domain_hash(DOMAIN_NODE, parent_input, sizeof(parent_input), NULL, 0, current_node)) {
-            memset(parent_input, 0, sizeof(parent_input));
+        if (!domain_hash(DOMAIN_NODE, parent_input, sizeof(parent_input), NULL, 0, current_node))
             return false;
-        }
-        memset(parent_input, 0, sizeof(parent_input));
     }
 
-    bool success = (memcmp(current_node, root, HASH_OUT_SIZE) == 0);
-    memset(current_node, 0, HASH_OUT_SIZE);
-    return success;
+    for (int layer = 1; layer < HT_LAYERS; ++layer) {
+        const hypertree_layer_t *Layer = &sig->layers[layer - 1];
+
+        uint64_t leaf_idx = (total_idx >> (layer * HT_TREE_HEIGHT)) & ((UINT64_C(1) << HT_TREE_HEIGHT) - 1);
+
+        if (!wots_recover_public(&Layer->sig, current_node, &pub)) return false;
+        if (!domain_hash(DOMAIN_LEAF, &pub, sizeof(pub), NULL, 0, current_node)) return false;
+
+        for (int h = 0; h < HT_TREE_HEIGHT; ++h) {
+            bool bit = (leaf_idx >> h) & 1;
+            unsigned char parent_input[HASH_OUT_SIZE * 2];
+            const unsigned char *auth_node = Layer->auth_path[h];
+
+            if (!bit) {
+                memcpy(parent_input, current_node, HASH_OUT_SIZE);
+                memcpy(parent_input + HASH_OUT_SIZE, auth_node, HASH_OUT_SIZE);
+            } else {
+                memcpy(parent_input, auth_node, HASH_OUT_SIZE);
+                memcpy(parent_input + HASH_OUT_SIZE, current_node, HASH_OUT_SIZE);
+            }
+
+            if (!domain_hash(DOMAIN_NODE, parent_input, sizeof(parent_input), NULL, 0, current_node))
+                return false;
+        }
+    }
+
+    return memcmp(current_node, root, HASH_OUT_SIZE) == 0;
 }
 
-#ifdef SSS_DEBUG
+#ifndef SSS_DEBUG
 // Only use this when actually debugging, uses printf!
 #include <stdio.h>
 

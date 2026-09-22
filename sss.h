@@ -1,5 +1,6 @@
 #ifndef SSS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #define HASH_OUT_SIZE 64
@@ -23,5 +24,14 @@ bool sss_sha512(const void *input, size_t input_size, void *output);
  * @return false The output is unsafe and should not be used, retry or fail
  */
 bool sss_get512randsecure(void *output);
+
+bool sss_generate_keypair(unsigned char *master_seed, unsigned char *root);
+bool sss_sign(const unsigned char *master_seed, const void *message, size_t message_size, unsigned char *signature_out);
+bool sss_verify(const unsigned char *root, const void *message, size_t message_size, const unsigned char *signature_in);
+
+#ifndef SSS_DEBUG
+// Only use this when actually debugging, uses printf!
+void sss_debug_test(void);
+#endif
 
 #endif
